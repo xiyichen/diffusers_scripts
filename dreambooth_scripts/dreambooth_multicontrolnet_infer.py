@@ -7,6 +7,15 @@ import cv2, glob
 import numpy as np
 from segment_anything import sam_model_registry, SamPredictor
 from ultralytics import YOLO
+from torchmetrics.functional.multimodal import clip_score
+from functools import partial
+
+clip_score_fn = partial(clip_score, model_name_or_path="openai/clip-vit-base-patch16")
+
+def calculate_clip_score(images, prompts):
+    images_int = (images).astype("uint8")
+    clip_score = clip_score_fn(torch.from_numpy(images_int).permute(0, 3, 1, 2), prompts).detach()
+    return round(float(clip_score), 4)
 
 def yolov8_detection(model, image):
     results = model(image, stream=True)  # generator of Results objects
@@ -39,7 +48,7 @@ controlnet_openpose = ControlNetModel.from_pretrained('lllyasviel/control_v11p_s
                                                        torch_dtype=torch.float16)
 
 pipe = StableDiffusionControlNetPipeline.from_pretrained(
-    "./sergey_masked_dreambooth_2x_pp_cr_checkpoints_2000",
+    "./sergey_checkpoints/sergey_masked_dreambooth_2x_pp_cr_checkpoints_2000",
     controlnet=[controlnet_depth, controlnet_openpose],
     safety_checker = None,
     requires_safety_checker = False,
@@ -47,10 +56,6 @@ pipe = StableDiffusionControlNetPipeline.from_pretrained(
 ).to(device)
 
 pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config, use_karras_sigmas=True)
-
-# open_pose = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
-# img = Image.open('/root/amass_priorpose/rom4_projected/000001.png').convert("RGB")
-# openpose_img = open_pose(img, detect_resolution=img.size, image_resolution=img.size, include_body=True, include_hand=True, include_face=True)
 openpose_img_all = sorted(glob.glob('/root/amass_priorpose/all_poses/*.png'))
 depth_img_all = sorted(glob.glob('/root/amass_priorpose/all_pose_smpl_vis/*.png'))
 keypoints_all = sorted(glob.glob('/root/amass_priorpose/all_poses_npy/*.npy'))
@@ -60,10 +65,6 @@ for i in range(len(openpose_img_all)):
     depth_img = Image.open(depth_img_all[i]).convert("RGB")
     assert openpose_img_all[i].split('_')[-1].split('.')[0] == depth_img_all[i].split('_')[-1].split('.')[0]
     w, h = openpose_img.size
-    # keypoints_np = np.load(keypoints_all[i])
-    # labels_np = np.ones((1, keypoints_np.shape[0]))
-    # keypoints = torch.from_numpy(keypoints_np)[None].to(device)
-    # labels = torch.from_numpy(labels_np).to(device)
     got_good_generation = False
     
     while not got_good_generation:
@@ -74,38 +75,35 @@ for i in range(len(openpose_img_all)):
                     width=openpose_img.size[0],
                     height=openpose_img.size[1],
                     image=[depth_img, openpose_img],
-                    controlnet_conditioning_scale=(0.3, 0.7),
-                    guidance_scale=25,
+                    controlnet_conditioning_scale=(0.25, 0.75),
+                    guidance_scale=7.5,
                     # generator=torch.Generator(device="cpu").manual_seed(42),
                     ).images[0]
 
-        # image.save(f'./sergey_amass/pose_{i}.png')
-        # image = cv2.cvtColor(cv2.imread(f'./sergey_amass/pose_{i}.png'), cv2.COLOR_BGR2RGB)
-        image_np = np.array(image)
+        image_np = np.array(image)[:, :, ::-1]
         
+        predictor.set_image(image_np)
         yolov8_boxes = yolov8_detection(yolo_model, image_np)
+        if len(yolov8_boxes) != 1:
+            continue
+        input_boxes = torch.tensor(yolov8_boxes, device=predictor.device)
+        transformed_boxes = predictor.transform.apply_boxes_torch(input_boxes, image_np.shape[:2])
+        masks, _, _ = predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes,
+            multimask_output=False,
+        )
+        mask = (masks[0].cpu().numpy().astype(np.int8)*255)[0]
+        image_np_masked = image_np
+        image_np_masked[mask==0] = 255
+        
+        clip_prompts = ["A photo of sks man wearing black t-shirt, black shorts, and black shoes"]
+        clip_images = image_np_masked[None]
+        sd_clip_score = calculate_clip_score(clip_images, clip_prompts)
+        
         x_min, y_min, x_max, y_max = yolov8_boxes[0]
-        if len(yolov8_boxes) == 1 and y_max < h and x_max < w:
+        if sd_clip_score >= 28 and y_max < h and x_max < w:
             got_good_generation = True
-            image.save(f'./sergey_results/sergey_amass_multicontrolnet_0.3_0.7/pose_{i}.png')
-            # input_boxes = torch.tensor(yolov8_boxes, device=predictor.device)
-            
-            # predictor.set_image(image)
-            # masks, _, _ = predictor.predict_torch(
-            #     # point_coords=keypoints,
-            #     # point_labels=labels,
-            #     point_coords=None,
-            #     point_labels=None,
-            #     boxes=input_boxes,
-            #     multimask_output=False,
-            # )
-            
-            # mask = masks[0][0].cpu().numpy().astype(np.int8)*255
-            # for idx_, loc in enumerate(keypoints_np):
-            #     x = int(loc[0])
-            #     y = int(loc[1])
-            #     cv2.circle(mask, (x, y), 10, (255, 0, 0), -1)
-            # mask = cv2.rectangle(mask, [int(input_boxes[0][0]), int(input_boxes[0][1])], 
-            #                      [int(input_boxes[0][2]), int(input_boxes[0][3])], (255, 0, 0), 2)
-            # cv2.imwrite('./test_mask.png', mask)
-            # exit()
+            image.save(f'./sergey_results/sergey_amass_multicontrolnet_0.25_0.75_guidance_7.5_clip_26/pose_{i}.png')
+            cv2.imwrite(f'./sergey_results/sergey_amass_multicontrolnet_0.25_0.75_guidance_7.5_clip_26_masks/pose_{i}.png', mask)
